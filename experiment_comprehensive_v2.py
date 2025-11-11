@@ -3,6 +3,11 @@ experiment_comprehensive_v2.py - Comprehensive parameter analysis
 Tests: (1) Convergence - how attack success changes with epochs (10/20/30/40/50)
        (2) Sampling density - how success changes with path points (50/100)
        (3) All settings (A,B,C) with 0,5,10,15,20,25 auxiliary images
+Modified version: FIXED CLASSES, VARIED MAIN IMAGES, DETERMINISTIC AUXILIARY SELECTION
+- Fixed classes for each setting
+- VARIED main images from training pool [130+] for each of 5 experiments
+- Deterministic auxiliary image selection (indices 0-24) - FIXED
+- Fixed test set (indices 30-129)
 """
 
 import torch

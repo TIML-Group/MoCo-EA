@@ -5,21 +5,42 @@ bezier_core.py - Core Bézier curve optimization implementation
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from utils import normalize_imagenet, project_l1_ball
+from utils import normalize_cifar10, project_l1_ball
+from data_utils import normalize_images
+from config import Config
 
 class BezierAdversarialUnconstrained:
     """Bézier curve optimization with unconstrained theta"""
     
-    def __init__(self, model, norm='linf', eps=4/255, lr=0.01, num_iter=100):
+    def __init__(self, model, config: Config, norm='linf', eps=None, lr=0.01, num_iter=100):
+        """
+        Initialize the Bézier adversarial attack
+
+        Args:
+            model: Target model
+            config: Configuration object
+            norm: Type of norm ('linf', 'l2', 'l1')
+            eps: Perturbation magnitude. If None, use the default value from config
+            lr: Learning rate
+            num_iter: Number of optimization iterations
+        """
+
         self.model = model
+        self.config = config
         self.norm = norm
-        self.eps = eps
+        self.eps = eps if eps is not None else config.experiment_config["epsilons"][norm]
         self.lr = lr
         self.num_iter = num_iter
     
     def bezier_curve(self, p0, p1, p2, t):
         """Quadratic Bézier curve: B(t) = (1-t)²p0 + 2(1-t)t·p1 + t²p2"""
         return (1 - t)**2 * p0 + 2 * (1 - t) * t * p1 + t**2 * p2
+    
+    def _normalize_images(self, images):
+        if self.config.dataset.value == "cifar10":
+            return normalize_cifar10(images)
+        else:
+            return normalize_images(images, self.config)
     
     def project_norm_ball(self, delta):
         """Project perturbation to specified norm ball"""
@@ -55,7 +76,7 @@ class BezierAdversarialUnconstrained:
                 delta_t = self.project_norm_ball(delta_t)
                 
                 x_adv = torch.clamp(x + delta_t, 0, 1)
-                x_adv_norm = normalize_imagenet(x_adv)
+                x_adv_norm = self._normalize_images(x_adv)
                 outputs = self.model(x_adv_norm)
                 
                 loss = -nn.CrossEntropyLoss()(outputs, y)
@@ -73,7 +94,7 @@ class BezierAdversarialUnconstrained:
             success_rates.append(successful_points / num_t_samples)
             theta_norms.append(torch.norm(theta.data.flatten()).item() / self.eps)
         
-        print(f"Final theta norm: {theta_norms[-1]:.2f} × eps (unconstrained)")
+        print(f"Final theta norm: {theta_norms[-1]:.2f} × eps ({self.norm} constrained)")
         
         return theta.detach(), losses, success_rates, theta_norms
     
@@ -102,8 +123,8 @@ class BezierAdversarialUnconstrained:
                 x1_adv = torch.clamp(x1 + delta_t, 0, 1)
                 x2_adv = torch.clamp(x2 + delta_t, 0, 1)
                 
-                outputs1 = self.model(normalize_imagenet(x1_adv))
-                outputs2 = self.model(normalize_imagenet(x2_adv))
+                outputs1 = self.model(self._normalize_images(x1_adv))
+                outputs2 = self.model(self._normalize_images(x2_adv))
                 
                 loss1 = -nn.CrossEntropyLoss()(outputs1, y)
                 loss2 = -nn.CrossEntropyLoss()(outputs2, y)
@@ -131,7 +152,7 @@ class BezierAdversarialUnconstrained:
             })
             theta_norms.append(torch.norm(theta.data.flatten()).item() / self.eps)
         
-        print(f"Final theta norm: {theta_norms[-1]:.2f} × eps (unconstrained)")
+        print(f"Final theta norm: {theta_norms[-1]:.2f} × eps ({self.norm} constrained)")
         return theta.detach(), losses, success_rates, theta_norms
     
     def optimize_setting_C(self, x1, x2, y1, y2, delta1, delta2, num_t_samples=20):
@@ -159,8 +180,8 @@ class BezierAdversarialUnconstrained:
                 x1_adv = torch.clamp(x1 + delta_t, 0, 1)
                 x2_adv = torch.clamp(x2 + delta_t, 0, 1)
                 
-                outputs1 = self.model(normalize_imagenet(x1_adv))
-                outputs2 = self.model(normalize_imagenet(x2_adv))
+                outputs1 = self.model(self._normalize_images(x1_adv))
+                outputs2 = self.model(self._normalize_images(x2_adv))
                 
                 loss1 = -nn.CrossEntropyLoss()(outputs1, y1)
                 loss2 = -nn.CrossEntropyLoss()(outputs2, y2)
@@ -188,7 +209,7 @@ class BezierAdversarialUnconstrained:
             })
             theta_norms.append(torch.norm(theta.data.flatten()).item() / self.eps)
         
-        print(f"Final theta norm: {theta_norms[-1]:.2f} × eps (unconstrained)")
+        print(f"Final theta norm: {theta_norms[-1]:.2f} × eps ({self.norm} constrained)")
         return theta.detach(), losses, success_rates, theta_norms
 
 
@@ -228,7 +249,7 @@ class BezierAdversarialMultiImage(BezierAdversarialUnconstrained):
                 
                 for img_idx, (x, y) in enumerate(zip(all_images, all_labels)):
                     x_adv = torch.clamp(x + delta_t, 0, 1)
-                    x_adv_norm = normalize_imagenet(x_adv)
+                    x_adv_norm = normalize_cifar10(x_adv)
                     outputs = self.model(x_adv_norm)
                     
                     loss = -nn.CrossEntropyLoss()(outputs, y)
@@ -292,7 +313,7 @@ class BezierAdversarialMultiImage(BezierAdversarialUnconstrained):
                 
                 for img_idx, (x, y_label) in enumerate(zip(all_images, all_labels)):
                     x_adv = torch.clamp(x + delta_t, 0, 1)
-                    outputs = self.model(normalize_imagenet(x_adv))
+                    outputs = self.model(self._normalize_images(x_adv))
                     
                     loss = -nn.CrossEntropyLoss()(outputs, y_label)
                     
@@ -356,7 +377,7 @@ class BezierAdversarialMultiImage(BezierAdversarialUnconstrained):
                 
                 for img_idx, (x, y_label) in enumerate(zip(all_images, all_labels)):
                     x_adv = torch.clamp(x + delta_t, 0, 1)
-                    outputs = self.model(normalize_imagenet(x_adv))
+                    outputs = self.model(self._normalize_images(x_adv))
                     
                     loss = -nn.CrossEntropyLoss()(outputs, y_label)
                     

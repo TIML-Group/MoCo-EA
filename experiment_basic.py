@@ -1,11 +1,11 @@
 """
-experiment_basic.py - Basic Bézier curve experiments
-Modified version with FIXED CLASSES to align with other experiments:
-- Uses fixed classes for each setting (same as multi_image and comprehensive)
-- Collects all available successful samples (no 5 experiments)
-- No separate test set (evaluates on training path only)
-- Maintains consistency with the experimental framework
+experiment_basic.py - Basic Bézier-curve experiment
+Adversarial attack experiments across multiple datasets and architectures
+- Use a fixed class configuration (consistent with other experiments)
+- Collect all available successful samples
+- Support CIFAR-10/ImageNet datasets and ResNet/ViT architectures
 """
+
 
 import torch
 import torchvision
@@ -18,13 +18,16 @@ from datetime import datetime
 from tqdm import tqdm
 from collections import defaultdict
 import random
+import argparse
 
 from utils import PGDAttack, normalize_cifar10
 from bezier_core import BezierAdversarialUnconstrained
+from config import Config, DatasetType, ModelType, TrainingMode
+from model_utils import create_model, load_saved_model
+from data_utils import load_dataset, organize_images_by_class, normalize_images
 
-# Set random seeds for reproducibility
 def set_random_seeds(seed=42):
-    """Set all random seeds for reproducibility"""
+    """设置随机种子以确保可重现性"""
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
@@ -34,67 +37,38 @@ def set_random_seeds(seed=42):
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
-# Set seeds at module level
-set_random_seeds(42)
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
-
-# FIXED CLASS CONFIGURATION (same as other experiments)
-FIXED_CLASSES = {
-    'setting_A': 3,        # cat (single class)
-    'setting_B': 3,        # cat (same class)
-    'setting_C': (3, 5)    # cat and dog (two different classes)
-}
-
-def load_model():
-    """Load pretrained ResNet-18 model"""
-    model = resnet18(pretrained=False)
-    model.conv1 = torch.nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-    model.maxpool = torch.nn.Identity()
-    model.fc = torch.nn.Linear(512, 10)
+def load_model(config: Config):
+    """加载模型"""
+    model_filename = config.get_model_filename()
     
-    if os.path.exists('resnet18_cifar10_best.pth'):
-        checkpoint = torch.load('resnet18_cifar10_best.pth', map_location=device)
-        model.load_state_dict(checkpoint['model'])
-        print(f"Loaded model with accuracy: {checkpoint['acc']:.2f}%")
+    if os.path.exists(model_filename):
+        model = load_saved_model(config, model_filename)
+        if model is None:
+            print(f"Failed to load model file.: {model_filename}")
+            return None
     else:
-        print("ERROR: No pretrained model found! Please run train_model.py first.")
-        exit(1)
+        print(f"Model file does not exist.: {model_filename}")
+        print("Please run train_model.py first to train a model")
+        return None
     
-    return model.to(device).eval()
+    return model.to(config.device).eval()
 
-def organize_images_by_class(dataloader, model, max_per_class=200):
-    """Organize images by class"""
-    images_by_class = defaultdict(list)
-    
-    for idx, (img, label) in enumerate(dataloader):
-        img_tensor = img.to(device)
-        label_tensor = label.to(device)
-        
-        with torch.no_grad():
-            pred = model(normalize_cifar10(img_tensor)).argmax(dim=1)
-            if pred == label_tensor:
-                images_by_class[label.item()].append((img_tensor, idx))
-                
-                # Need at least max_per_class images per class
-                if all(len(imgs) >= max_per_class for imgs in images_by_class.values()) and len(images_by_class) == 10:
-                    break
-    
-    return images_by_class
+def organize_images_by_class_legacy(dataloader, model, config: Config, max_per_class=200):
+    """按类别组织图像（兼容性函数）"""
+    return organize_images_by_class(dataloader, model, config, max_per_class)
 
 def evaluate_bezier_path(model, bezier_obj, delta1, theta, delta2, x1, x2, y1, y2, 
-                        setting_type='A', num_points=50):
-    """Evaluate Bézier path at multiple points (excluding endpoints)"""
-    # Exclude endpoints to avoid evaluation bias
-    t_values = torch.linspace(0.02, 0.98, num_points).to(device)
+                        config: Config, setting_type='A', num_points=50):
+    """评估贝塞尔路径在多个点上的成功率（排除端点）"""
+    # 排除端点以避免评估偏差
+    t_values = torch.linspace(0.02, 0.98, num_points).to(config.device)
     
     if setting_type == 'A':
-        # Setting A: Single image - both x1 and x2 are the same
+        # Setting A: 单图像 - x1和x2相同
         x2 = x1
         y2 = y1
     
-    # Track success for each image
+    # 跟踪每个图像的成功率
     success_x1 = 0
     success_x2 = 0
     success_both = 0
@@ -104,23 +78,37 @@ def evaluate_bezier_path(model, bezier_obj, delta1, theta, delta2, x1, x2, y1, y
             delta_t = bezier_obj.bezier_curve(delta1, theta, delta2, t)
             delta_t = bezier_obj.project_norm_ball(delta_t)
             
-            # Test on first image
+            # 测试第一个图像
             x1_adv = torch.clamp(x1 + delta_t, 0, 1)
-            outputs1 = model(normalize_cifar10(x1_adv))
-            pred1 = outputs1.argmax(dim=1).item()
+            x1_adv_norm = normalize_images(x1_adv, config)
+            outputs1 = model(x1_adv_norm)
+            
+            # 处理ViT模型的输出格式
+            if hasattr(outputs1, 'logits'):
+                logits1 = outputs1.logits
+            else:
+                logits1 = outputs1
+            pred1 = logits1.argmax(dim=1).item()
             s1 = pred1 != y1.item()
             
             if setting_type == 'A':
-                # For Setting A, only one image to test
+                # Setting A只测试一个图像
                 if s1:
                     success_x1 += 1
-                    success_x2 += 1  # Same as x1 for Setting A
+                    success_x2 += 1  # Setting A中与x1相同
                     success_both += 1
             else:
-                # Test on second image for Settings B and C
+                # Settings B和C测试第二个图像
                 x2_adv = torch.clamp(x2 + delta_t, 0, 1)
-                outputs2 = model(normalize_cifar10(x2_adv))
-                pred2 = outputs2.argmax(dim=1).item()
+                x2_adv_norm = normalize_images(x2_adv, config)
+                outputs2 = model(x2_adv_norm)
+                
+                # 处理ViT模型的输出格式
+                if hasattr(outputs2, 'logits'):
+                    logits2 = outputs2.logits
+                else:
+                    logits2 = outputs2
+                pred2 = logits2.argmax(dim=1).item()
                 s2 = pred2 != y2.item()
                 
                 if s1:
@@ -137,52 +125,65 @@ def evaluate_bezier_path(model, bezier_obj, delta1, theta, delta2, x1, x2, y1, y
         'success_rate_avg': (success_x1 + success_x2) / (2 * num_points)
     }
 
-def collect_samples_setting_A(images_by_class, model, pgd_attack, bezier, norm, target_samples=25):
-    """Collect samples for Setting A (single image)"""
-    class_id = FIXED_CLASSES['setting_A']
+def collect_samples_setting_A(images_by_class, model, pgd_attack, bezier, config: Config, target_samples=25):
+    """收集Setting A（单图像）的样本"""
+    class_id = config.experiment_config["fixed_classes"]['setting_A']
     
     if class_id not in images_by_class:
-        print(f"    ERROR: Class {class_id} not available")
+        print(f"    Error: Class {class_id} is not available.")
         return []
     
     available_images = images_by_class[class_id]
-    print(f"    Setting A: Using class {class_id} with {len(available_images)} available images")
+    print(f"    Setting A: Using class {class_id}, {len(available_images)} images available.")
     
     samples = []
     attempts = 0
-    max_attempts = min(len(available_images) * 10, 500)  # Reasonable limit
+    max_attempts = min(len(available_images) * 10, 500)  # 合理限制
     
-    pbar = tqdm(total=target_samples, desc=f"    Collecting Setting A samples")
+    pbar = tqdm(total=target_samples, desc=f"    Collecting Setting A samples.")
     
     while len(samples) < target_samples and attempts < max_attempts:
-        # Select an image
+        # 选择一个图像
         img_idx = attempts % len(available_images)
         x = available_images[img_idx][0]
-        y = torch.tensor([class_id]).to(device)
+        y = torch.tensor([class_id]).to(config.device)
         
         attempts += 1
         
-        # Generate two perturbations for the same image
+        # 为同一图像生成两个扰动
         delta1 = pgd_attack.perturb(x, y)
         delta2 = pgd_attack.perturb(x, y)
         
-        # Verify both endpoints work
+        # 验证两个端点都有效
         with torch.no_grad():
             x_adv_d1 = torch.clamp(x + delta1, 0, 1)
             x_adv_d2 = torch.clamp(x + delta2, 0, 1)
-            pred_d1 = model(normalize_cifar10(x_adv_d1)).argmax(dim=1)
-            pred_d2 = model(normalize_cifar10(x_adv_d2)).argmax(dim=1)
+            x_adv_d1_norm = normalize_images(x_adv_d1, config)
+            x_adv_d2_norm = normalize_images(x_adv_d2, config)
+            # 处理ViT模型的输出格式
+            outputs_d1 = model(x_adv_d1_norm)
+            outputs_d2 = model(x_adv_d2_norm)
+            
+            if hasattr(outputs_d1, 'logits'):
+                pred_d1 = outputs_d1.logits.argmax(dim=1)
+            else:
+                pred_d1 = outputs_d1.argmax(dim=1)
+                
+            if hasattr(outputs_d2, 'logits'):
+                pred_d2 = outputs_d2.logits.argmax(dim=1)
+            else:
+                pred_d2 = outputs_d2.argmax(dim=1)
             
             if pred_d1 == y or pred_d2 == y:
                 continue
         
-        # Optimize Bézier path
+        # 优化贝塞尔路径
         theta, _, _, theta_norms = bezier.optimize_setting_A(x, y, delta1, delta2)
         
-        # Evaluate path
+        # 评估路径
         eval_results = evaluate_bezier_path(
             model, bezier, delta1, theta, delta2, 
-            x, x, y, y, setting_type='A'
+            x, x, y, y, config, setting_type='A'
         )
         
         samples.append({
@@ -193,35 +194,35 @@ def collect_samples_setting_A(images_by_class, model, pgd_attack, bezier, norm, 
         })
         
         pbar.update(1)
-    
+
     pbar.close()
-    print(f"    Collected {len(samples)} samples for Setting A (attempts: {attempts})")
+    print(f"    Collected {len(samples)} samples for Setting A (attempts: {attempts}).")
     
     return samples
 
-def collect_samples_setting_B(images_by_class, model, pgd_attack, bezier, norm, target_samples=25):
-    """Collect samples for Setting B (same class)"""
-    class_id = FIXED_CLASSES['setting_B']
+def collect_samples_setting_B(images_by_class, model, pgd_attack, bezier, config: Config, target_samples=25):
+    """收集Setting B（同类）的样本"""
+    class_id = config.experiment_config["fixed_classes"]['setting_B']
     
     if class_id not in images_by_class:
-        print(f"    ERROR: Class {class_id} not available")
+        print(f"    Error: Class {class_id} is not available.")
         return []
     
     available_images = images_by_class[class_id]
-    print(f"    Setting B: Using class {class_id} with {len(available_images)} available images")
+    print(f"    Setting B: Using class {class_id}, {len(available_images)} images available.")
     
     if len(available_images) < 2:
-        print(f"    ERROR: Need at least 2 images for Setting B")
+        print(f"    Error: Setting B requires at least 2 images.")
         return []
     
     samples = []
     attempts = 0
     max_attempts = min(len(available_images) * len(available_images), 500)
     
-    pbar = tqdm(total=target_samples, desc=f"    Collecting Setting B samples")
+    pbar = tqdm(total=target_samples, desc=f"    Collecting Setting B samples.")
     
     while len(samples) < target_samples and attempts < max_attempts:
-        # Select two different images from the same class
+        # 从同一类别选择两个不同的图像
         idx1 = attempts % len(available_images)
         idx2 = (attempts + 1 + (attempts // len(available_images))) % len(available_images)
         
@@ -230,29 +231,45 @@ def collect_samples_setting_B(images_by_class, model, pgd_attack, bezier, norm, 
         
         x1 = available_images[idx1][0]
         x2 = available_images[idx2][0]
-        y = torch.tensor([class_id]).to(device)
+        y = torch.tensor([class_id]).to(config.device)
         
         attempts += 1
         
-        # Generate perturbations for each image
+        # 为每个图像生成扰动
         delta1 = pgd_attack.perturb(x1, y)
         delta2 = pgd_attack.perturb(x2, y)
         
-        # Verify endpoints work
+        # 验证端点有效
         with torch.no_grad():
-            pred1 = model(normalize_cifar10(torch.clamp(x1 + delta1, 0, 1))).argmax(1)
-            pred2 = model(normalize_cifar10(torch.clamp(x2 + delta2, 0, 1))).argmax(1)
+            x1_adv = torch.clamp(x1 + delta1, 0, 1)
+            x2_adv = torch.clamp(x2 + delta2, 0, 1)
+            x1_adv_norm = normalize_images(x1_adv, config)
+            x2_adv_norm = normalize_images(x2_adv, config)
+            
+            # 处理ViT模型的输出格式
+            outputs1 = model(x1_adv_norm)
+            outputs2 = model(x2_adv_norm)
+            
+            if hasattr(outputs1, 'logits'):
+                pred1 = outputs1.logits.argmax(1)
+            else:
+                pred1 = outputs1.argmax(1)
+                
+            if hasattr(outputs2, 'logits'):
+                pred2 = outputs2.logits.argmax(1)
+            else:
+                pred2 = outputs2.argmax(1)
             
             if pred1 == y or pred2 == y:
                 continue
         
-        # Optimize Bézier path
+        # 优化贝塞尔路径
         theta, _, _, theta_norms = bezier.optimize_setting_B(x1, x2, y, delta1, delta2)
         
-        # Evaluate path
+        # 评估路径
         eval_results = evaluate_bezier_path(
             model, bezier, delta1, theta, delta2, 
-            x1, x2, y, y, setting_type='B'
+            x1, x2, y, y, config, setting_type='B'
         )
         
         samples.append({
@@ -265,60 +282,76 @@ def collect_samples_setting_B(images_by_class, model, pgd_attack, bezier, norm, 
         pbar.update(1)
     
     pbar.close()
-    print(f"    Collected {len(samples)} samples for Setting B (attempts: {attempts})")
+    print(f"    Collected {len(samples)} samples for Setting B (attempts: {attempts}).")
     
     return samples
 
-def collect_samples_setting_C(images_by_class, model, pgd_attack, bezier, norm, target_samples=25):
-    """Collect samples for Setting C (different classes)"""
-    class_id1, class_id2 = FIXED_CLASSES['setting_C']
+def collect_samples_setting_C(images_by_class, model, pgd_attack, bezier, config: Config, target_samples=25):
+    """收集Setting C（不同类）的样本"""
+    class_id1, class_id2 = config.experiment_config["fixed_classes"]['setting_C']
     
     if class_id1 not in images_by_class or class_id2 not in images_by_class:
-        print(f"    ERROR: Classes {class_id1} or {class_id2} not available")
+        print(f"    Error: Class {class_id1} or {class_id2} is not available.")
         return []
     
     available_images1 = images_by_class[class_id1]
     available_images2 = images_by_class[class_id2]
-    print(f"    Setting C: Using classes {class_id1} ({len(available_images1)} images) "
-          f"and {class_id2} ({len(available_images2)} images)")
+    print(f"    Setting C: Using class {class_id1} ({len(available_images1)} images). "
+          f"and {class_id2} ({len(available_images2)} images).")
     
     samples = []
     attempts = 0
     max_attempts = min(len(available_images1) * len(available_images2), 500)
     
-    pbar = tqdm(total=target_samples, desc=f"    Collecting Setting C samples")
+    pbar = tqdm(total=target_samples, desc=f"    Collecting Setting C samples.")
     
     while len(samples) < target_samples and attempts < max_attempts:
-        # Select one image from each class
+        # 从每个类别选择一张图像
         idx1 = attempts % len(available_images1)
         idx2 = attempts % len(available_images2)
         
         x1 = available_images1[idx1][0]
         x2 = available_images2[idx2][0]
-        y1 = torch.tensor([class_id1]).to(device)
-        y2 = torch.tensor([class_id2]).to(device)
+        y1 = torch.tensor([class_id1]).to(config.device)
+        y2 = torch.tensor([class_id2]).to(config.device)
         
         attempts += 1
         
-        # Generate perturbations for each image
+        # 为每个图像生成扰动
         delta1 = pgd_attack.perturb(x1, y1)
         delta2 = pgd_attack.perturb(x2, y2)
         
-        # Verify endpoints work
+        # 验证端点有效
         with torch.no_grad():
-            pred1 = model(normalize_cifar10(torch.clamp(x1 + delta1, 0, 1))).argmax(1)
-            pred2 = model(normalize_cifar10(torch.clamp(x2 + delta2, 0, 1))).argmax(1)
+            x1_adv = torch.clamp(x1 + delta1, 0, 1)
+            x2_adv = torch.clamp(x2 + delta2, 0, 1)
+            x1_adv_norm = normalize_images(x1_adv, config)
+            x2_adv_norm = normalize_images(x2_adv, config)
+            
+            # 处理ViT模型的输出格式
+            outputs1 = model(x1_adv_norm)
+            outputs2 = model(x2_adv_norm)
+            
+            if hasattr(outputs1, 'logits'):
+                pred1 = outputs1.logits.argmax(1)
+            else:
+                pred1 = outputs1.argmax(1)
+                
+            if hasattr(outputs2, 'logits'):
+                pred2 = outputs2.logits.argmax(1)
+            else:
+                pred2 = outputs2.argmax(1)
             
             if pred1 == y1 or pred2 == y2:
                 continue
         
-        # Optimize Bézier path
+        # 优化贝塞尔路径
         theta, _, _, theta_norms = bezier.optimize_setting_C(x1, x2, y1, y2, delta1, delta2)
         
-        # Evaluate path
+        # 评估路径
         eval_results = evaluate_bezier_path(
             model, bezier, delta1, theta, delta2, 
-            x1, x2, y1, y2, setting_type='C'
+            x1, x2, y1, y2, config, setting_type='C'
         )
         
         samples.append({
@@ -331,24 +364,35 @@ def collect_samples_setting_C(images_by_class, model, pgd_attack, bezier, norm, 
         pbar.update(1)
     
     pbar.close()
-    print(f"    Collected {len(samples)} samples for Setting C (attempts: {attempts})")
+    print(f"    Collected {len(samples)} samples for Setting C (attempts: {attempts}).")
     
     return samples
 
-def print_results_fixed(results):
+def print_results_fixed(results, config):
     """Print results in fixed class format"""
     print("\n" + "="*120)
     print("BASIC EXPERIMENTS - FIXED CLASSES RESULTS")
     print("="*120)
     
+    # 获取固定类别配置
+    fixed_classes = config.experiment_config["fixed_classes"]
+    
     # Print configuration
-    class_names = ['airplane', 'automobile', 'bird', 'cat', 'deer',
-                   'dog', 'frog', 'horse', 'ship', 'truck']
-    print("\nFixed Configuration:")
-    print(f"  Setting A: Class {FIXED_CLASSES['setting_A']} ({class_names[FIXED_CLASSES['setting_A']]})")
-    print(f"  Setting B: Class {FIXED_CLASSES['setting_B']} ({class_names[FIXED_CLASSES['setting_B']]})")
-    c1, c2 = FIXED_CLASSES['setting_C']
-    print(f"  Setting C: Classes {c1} ({class_names[c1]}) and {c2} ({class_names[c2]})")
+    if config.dataset == DatasetType.CIFAR10:
+        class_names = ['airplane', 'automobile', 'bird', 'cat', 'deer',
+                       'dog', 'frog', 'horse', 'ship', 'truck']
+        print("\nFixed Configuration:")
+        print(f"  Setting A: Class {fixed_classes['setting_A']} ({class_names[fixed_classes['setting_A']]})")
+        print(f"  Setting B: Class {fixed_classes['setting_B']} ({class_names[fixed_classes['setting_B']]})")
+        c1, c2 = fixed_classes['setting_C']
+        print(f"  Setting C: Classes {c1} ({class_names[c1]}) and {c2} ({class_names[c2]})")
+    else:
+        # Mini-ImageNet没有预定义的类别名称
+        print("\nFixed Configuration:")
+        print(f"  Setting A: Class {fixed_classes['setting_A']}")
+        print(f"  Setting B: Class {fixed_classes['setting_B']}")
+        c1, c2 = fixed_classes['setting_C']
+        print(f"  Setting C: Classes {c1} and {c2}")
     
     # Detailed results for each norm and setting
     for norm in ['linf', 'l2', 'l1']:
@@ -479,96 +523,85 @@ def print_results_fixed(results):
     print("• Collects all available successful samples")
     print("• Aligned with multi_image and comprehensive experiments")
 
-def run_basic_experiments_fixed():
-    """Run basic Bézier curve experiments with fixed classes"""
-    model = load_model()
+def run_basic_experiments_fixed(config: Config):
+    """运行基础贝塞尔曲线实验（固定类别）"""
+    # 设置随机种子
+    set_random_seeds(42)
     
-    norms = ['linf', 'l2', 'l1']
-    epsilons = {
-        'linf': 8/255,
-        'l2': 0.5,
-        'l1': 10.0
-    }
+    # 加载模型
+    model = load_model(config)
+    if model is None:
+        return None
     
-    pgd_steps = 40
+    # 加载数据集
+    _, test_loader = load_dataset(config)
     
-    # Community standard alpha factors for 40-step PGD
-    pgd_alpha_factors = {
-        'linf': 4.0,    # α = ε/4 (community standard for 40 steps)
-        'l2': 5.0,      # α = ε/5 (moderate attack)
-        'l1': 10.0      # α = ε/10 (stable optimization)
-    }
+    print("\nOrganize images by class...")
+    images_by_class = organize_images_by_class(test_loader, model, config, max_per_class=200)
     
-    transform_test = transforms.Compose([transforms.ToTensor()])
-    testset = torchvision.datasets.CIFAR10(
-        root='./data', train=False, download=True, transform=transform_test)
-    testloader = torch.utils.data.DataLoader(
-        testset, batch_size=1, shuffle=False, num_workers=2)
-    
-    print("\nOrganizing images by class...")
-    images_by_class = organize_images_by_class(testloader, model, max_per_class=200)
-    
-    # Check availability of fixed classes
-    class_names = ['airplane', 'automobile', 'bird', 'cat', 'deer',
-                   'dog', 'frog', 'horse', 'ship', 'truck']
+    # 检查固定类别的可用性
+    class_names = config.get_class_names()
+    if class_names is None:
+        class_names = [f"Class_{i}" for i in range(config.get_num_classes())]
     
     print("\nFixed class availability:")
-    required_classes = set([FIXED_CLASSES['setting_A'], FIXED_CLASSES['setting_B']] + 
-                           list(FIXED_CLASSES['setting_C']))
+    required_classes = set([config.experiment_config["fixed_classes"]['setting_A'], 
+                           config.experiment_config["fixed_classes"]['setting_B']] + 
+                           list(config.experiment_config["fixed_classes"]['setting_C']))
     
     for class_id in required_classes:
         if class_id in images_by_class:
-            print(f"  Class {class_id} ({class_names[class_id]}): {len(images_by_class[class_id])} images")
+            print(f"  Class {class_id} ({class_names[class_id] if class_id < len(class_names) else f'Class_{class_id}'}): {len(images_by_class[class_id])} images.")
         else:
-            print(f"  ERROR: Class {class_id} ({class_names[class_id]}) not available!")
+            print(f"  Error: Class {class_id} is not available!")
             return None
     
-    target_samples = 25
-    print(f"\nTarget: {target_samples} samples per setting per norm")
-    print(f"PGD attack iterations: {pgd_steps} (with community standard α)")
-    print(f"Bézier optimization: 30 iterations with lr=0.01")
+    target_samples = config.experiment_config["target_samples"]
+    print(f"\nTarget: {target_samples} samples per norm per setting")
+    print(f"PGD attack iterations: {config.experiment_config['pgd_iterations']} (using community-standard α)")
+    print(f"Bézier optimization: {config.experiment_config['bezier_iterations']} iterations, learning rate 0.01")
     print("="*80)
+
     
     all_results = {}
+    norms = ['linf', 'l2', 'l1']
     
     for norm in norms:
         print(f"\n{'='*80}")
-        print(f"Testing {norm.upper()} norm (ε={epsilons[norm]})")
+        print(f"Test {norm.upper()} norm (ε={config.experiment_config['epsilons'][norm]})")
         print(f"{'='*80}")
         
-        eps = epsilons[norm]
-        alpha = eps / pgd_alpha_factors[norm]
+        # 创建PGD攻击
+        pgd_attack = PGDAttack(model, config, norm=norm)
         
-        pgd_attack = PGDAttack(model, eps=eps, alpha=alpha, 
-                              num_iter=pgd_steps, norm=norm)
-        
-        bezier = BezierAdversarialUnconstrained(model, norm=norm, eps=eps, 
-                                               lr=0.01, num_iter=30)
+        # 创建贝塞尔优化器
+        bezier = BezierAdversarialUnconstrained(model, config, norm=norm, 
+                                               lr=0.01, num_iter=config.experiment_config['bezier_iterations'])
         
         norm_results = {}
         
-        # Setting A: Single Image
-        print(f"\n  Setting A (Single Image):")
-        samples_A = collect_samples_setting_A(images_by_class, model, pgd_attack, bezier, norm, target_samples)
+        # Setting A: 单图像
+        print(f"\n  Setting A (Simple Image):")
+        samples_A = collect_samples_setting_A(images_by_class, model, pgd_attack, bezier, config, target_samples)
         norm_results['setting_A'] = samples_A
         
-        # Setting B: Same Class
-        print(f"\n  Setting B (Same Class):")
-        samples_B = collect_samples_setting_B(images_by_class, model, pgd_attack, bezier, norm, target_samples)
+        # Setting B: 同类
+        print(f"\n  Setting B (Same Classificaition):")
+        samples_B = collect_samples_setting_B(images_by_class, model, pgd_attack, bezier, config, target_samples)
         norm_results['setting_B'] = samples_B
         
-        # Setting C: Different Classes
-        print(f"\n  Setting C (Different Classes):")
-        samples_C = collect_samples_setting_C(images_by_class, model, pgd_attack, bezier, norm, target_samples)
+        # Setting C: 不同类
+        print(f"\n  Setting C (Different Classificaition):")
+        samples_C = collect_samples_setting_C(images_by_class, model, pgd_attack, bezier, config, target_samples)
         norm_results['setting_C'] = samples_C
         
         all_results[norm] = norm_results
         
-        # Print summary for this norm
-        print(f"\n  {norm.upper()} Summary:")
-        print(f"    Setting A: {len(samples_A)} samples collected")
-        print(f"    Setting B: {len(samples_B)} samples collected")
-        print(f"    Setting C: {len(samples_C)} samples collected")
+        # 打印该范数的摘要
+        print(f"\n  {norm.upper()} Abstract:")
+        print(f"    Setting A: Collected {len(samples_A)} samples")
+        print(f"    Setting B: Collected {len(samples_B)} samples")
+        print(f"    Setting C: Collected {len(samples_C)} samples")
     
     return all_results
 
@@ -622,40 +655,70 @@ def save_results_fixed(results):
     print(f"\nResults saved to {filename}")
     return filename
 
-if __name__ == "__main__":
-    print("Bézier Adversarial Curves - Basic Experiments (FIXED CLASSES)")
+def main():
+    """主函数，支持命令行参数"""
+    parser = argparse.ArgumentParser(description='Base Bézier-curve Experiment')
+    parser.add_argument('--dataset', type=str, default='cifar10', 
+                       choices=['cifar10', 'imagenet'], help='Choosing Dataset')
+    parser.add_argument('--model', type=str, default='resnet', 
+                       choices=['resnet', 'vit'], help='Choosing Architecture')
+    parser.add_argument('--mode', type=str, default='from_scratch',
+                       choices=['pretrained', 'fine_tune', 'from_scratch'],
+                       help='Choosing Training Mode')
+    parser.add_argument('--device', type=str, default='auto',
+                       help='Choosing Device (auto/cuda/cpu)')
+    
+    args = parser.parse_args()
+    
+    # 创建配置
+    dataset = DatasetType.CIFAR10 if args.dataset == 'cifar10' else DatasetType.IMAGENET
+    model = ModelType.RESNET if args.model == 'resnet' else ModelType.VIT
+    mode = TrainingMode.PRETRAINED if args.mode == 'pretrained' else \
+           TrainingMode.FINE_TUNE if args.mode == 'fine_tune' else TrainingMode.FROM_SCRATCH
+    
+    config = Config(dataset=dataset, model=model, training_mode=mode, device=args.device)
+    
+    print("Bézier adversarial curves - Basic experiment (fixed classes)")
     print("="*80)
-    print("\nKey Design (aligned with multi_image and comprehensive):")
-    print("• FIXED classes for all settings:")
-    print("  - Setting A: Class 3 (cat) - single image")
-    print("  - Setting B: Class 3 (cat) - same class pairs")
-    print("  - Setting C: Classes 3 & 5 (cat & dog) - different classes")
+    print("\nKey design (consistent with multi_image and comprehensive):")
+    print("• Fixed classes for all settings:")
+    print(f"  - Setting A: class {config.experiment_config['fixed_classes']['setting_A']} - single image")
+    print(f"  - Setting B: class {config.experiment_config['fixed_classes']['setting_B']} - same-class pair")
+    print(f"  - Setting C: class {config.experiment_config['fixed_classes']['setting_C']} - different-class pair")
     print("• Collect all available successful samples (target: 25 per setting)")
-    print("• No separate test set (evaluates on training path)")
-    print("• PGD attack with 40 iterations and community standard α")
-    print("• Bézier optimization: 30 iterations with lr=0.01")
+    print("• No separate test set (evaluate on the training paths)")
+    print("• PGD attack: 40 iterations, using community-standard α")
+    print("• Bézier optimization: 30 iterations, learning rate 0.01")
     print("="*80)
+
     
-    if not os.path.exists('resnet18_cifar10_best.pth'):
-        print("\nERROR: No trained model found!")
-        print("Please run 'python train_model.py' first.")
-        exit(1)
+    # 检查模型文件是否存在
+    model_filename = config.get_model_filename()
+    if not os.path.exists(model_filename):
+        print(f"\nError: Trained model not found!")
+        print(f"Please run 'python train_model.py --dataset {args.dataset} --model {args.model} --mode {args.mode}' first")
+
+        return
     
-    # Run experiments
-    results = run_basic_experiments_fixed()
+    # 运行实验
+    results = run_basic_experiments_fixed(config)
     
     if results:
-        # Print results
-        print_results_fixed(results)
+        # 打印结果
+        print_results_fixed(results, config)
         
-        # Save results
+        # 保存结果
         results_file = save_results_fixed(results)
         
-        print(f"\nExperiments completed!")
-        print(f"Results saved to: {results_file}")
+        print(f"\Experiment Complete!")
+        print(f"The result will be saved in: {results_file}")
         
-        print("\nAlignment with other experiments:")
-        print("• Uses same fixed classes as multi_image and comprehensive")
-        print("• No test set separation (basic experiment evaluates on path only)")
+        print("\nConsistency with other experiments:")
+        print("• Uses the same fixed classes as multi_image and comprehensive experiments")
+        print("• No separate test set (basic experiment evaluates only on paths)")
         print("• Consistent PGD parameters (40 iterations, community α)")
-        print("• Provides baseline for comparison with multi-image optimization")
+        print("• Serves as a baseline for comparison with multi-image optimization")
+
+
+if __name__ == "__main__":
+    main()

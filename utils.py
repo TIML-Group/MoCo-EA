@@ -1,20 +1,13 @@
 """
 utils.py - Utility functions for Bézier experiments
+Mutiple Dataset and Architecture is Supported
 """
 
 import torch
 import torch.nn as nn
 import numpy as np
-
-import timm
-from timm.data import resolve_data_config
-
-_cfg = resolve_data_config({}, model=timm.create_model("vit_base_patch16_224", pretrained=True))
-
-def normalize_imagenet(x):
-    mean = torch.tensor(_cfg['mean']).view(1,3,1,1).to(x.device)
-    std = torch.tensor(_cfg['std']).view(1,3,1,1).to(x.device)
-    return (x - mean) / std
+from data_utils import normalize_images
+from config import Config
 
 def normalize_cifar10(x):
     """Normalize CIFAR-10 images"""
@@ -59,21 +52,43 @@ def project_l1_ball(x, eps):
 class PGDAttack:
     """PGD Attack implementation supporting L1, L2, and Linf norms"""
     
-    def __init__(self, model, eps, alpha=None, num_iter=None, norm='linf', randomize=True):
+    def __init__(self, model, config: Config, eps=None, alpha=None, num_iter=None, norm='linf', randomize=True):
+        """
+        Initialize the PGD attack
+
+        Args:
+            model: Target model
+            config: Configuration object
+            eps: Perturbation magnitude. If None, use the default value from config
+            alpha: Step size. If None, use the default value
+            num_iter: Number of iterations. If None, use the default value
+            norm: Type of norm
+            randomize: Whether to use random initialization
+        """
+
+        
         self.model = model
-        self.eps = eps
+        self.config = config
+        self.eps = eps if eps is not None else config.experiment_config["epsilons"][norm]
         self.norm = norm
         self.randomize = randomize
         
         if alpha is None:
-            self.alpha = eps / 4 if norm == 'linf' else eps / 10
+            alpha_factor = config.experiment_config["pgd_alpha_factors"][norm]
+            self.alpha = self.eps / alpha_factor
         else:
             self.alpha = alpha
             
         if num_iter is None:
-            self.num_iter = 40 if norm == 'linf' else 40
+            self.num_iter = config.experiment_config["pgd_iterations"]
         else:
             self.num_iter = num_iter
+    
+    def _normalize_images(self, images):
+        if self.config.dataset.value == "cifar10":
+            return normalize_cifar10(images)
+        else:
+            return normalize_images(images, self.config)
     
     def project_perturbation(self, delta, norm):
         """Project perturbation onto the norm ball"""
@@ -111,12 +126,12 @@ class PGDAttack:
         else:
             delta = torch.zeros_like(x)
         
-        x_adv = torch.clamp(x + delta, x_min, x_max) 
+        x_adv = torch.clamp(x + delta, x_min, x_max)
         
-        for t in range(self.num_iter):
+        for _ in range(self.num_iter):
             x_adv.requires_grad_(True)
             
-            x_adv_norm = normalize_imagenet(x_adv)
+            x_adv_norm = self._normalize_images(x_adv)
             outputs = self.model(x_adv_norm)
             loss = nn.CrossEntropyLoss()(outputs, y)
             
@@ -135,12 +150,12 @@ class PGDAttack:
                 delta = x_adv - x
                 delta = self.project_perturbation(delta, self.norm)
                 x_adv = torch.clamp(x + delta, x_min, x_max)
-              
+            
             x_adv = x_adv.detach()
         
         return (x_adv - x).detach()
 
-def evaluate_accuracy(model, dataloader, device):
+def evaluate_accuracy(model, dataloader, config: Config):
     """Evaluate model accuracy on a dataset"""
     model.eval()
     correct = 0
@@ -148,11 +163,22 @@ def evaluate_accuracy(model, dataloader, device):
     
     with torch.no_grad():
         for inputs, targets in dataloader:
-            inputs, targets = inputs.to(device), targets.to(device)
-            inputs_norm = normalize_imagenet(inputs)
-            outputs = model(inputs_norm)
-            _, predicted = outputs.max(1)
+            inputs, targets = inputs.to(config.device), targets.to(config.device)
+            outputs = model(inputs)
+            
+            # 处理ViT模型的输出格式
+            if hasattr(outputs, 'logits'):
+                logits = outputs.logits
+            else:
+                logits = outputs
+                
+            _, predicted = logits.max(1)
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
     
     return 100. * correct / total
+
+def get_cifar10_classes():
+    """Return CIFAR-10 class names"""
+    return ['airplane', 'automobile', 'bird', 'cat', 'deer',
+            'dog', 'frog', 'horse', 'ship', 'truck']
