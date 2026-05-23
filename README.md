@@ -10,6 +10,30 @@
 * (2026/05): Our paper has been accepted at [ICML 2026](https://icml.cc/)🎉🎉🎉🎉
 * (2026/04): Our paper has been accepted for Oral Presentation at [ICLR 2026 Workshop on Principled Design for Trustworthy AI](https://trustworthy-ai-workshop.github.io/iclr2026/)🎉🎉🎉🎉
 
+### Setup
+```bash
+pip install -r requirements.txt
+```
+
+### Running Experiments
+All experiments are launched from the repository root using `run_experiment.py`:
+
+```bash
+# Mode connectivity
+python run_experiment.py --experiment connectivity --dataset cifar10 --data-root ./dataset/CIFAR10 --checkpoint resnet18_cifar10_best.pth --output-dir ./results
+python run_experiment.py --experiment connectivity --dataset imagenet --data-root ./dataset/imagenet/val --output-dir ./results
+
+# Other experiments
+python run_experiment.py --experiment evolutionary --dataset cifar10 --data-root ./dataset/CIFAR10 --checkpoint resnet18_cifar10_best.pth --output-dir ./results
+python run_experiment.py --experiment transferability --dataset imagenet --data-root ./dataset/imagenet/val --output-dir ./results
+```
+
+CIFAR-10 experiments expect a trained `resnet18_cifar10_best.pth` checkpoint. It can be generated with:
+
+```bash
+python cifar10/train_model.py --data-root ./dataset/CIFAR10 --output-dir .
+```
+
 ### Cite
 ```
 @inproceedings{kim2026mocoea,
